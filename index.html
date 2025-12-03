@@ -2,8 +2,8 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Three.js 分子實驗室</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Three.js 分子實驗室 (增量控制版)</title>
     
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
@@ -18,6 +18,7 @@
             background-color: #121212;
             font-family: sans-serif;
             color: #ffffff;
+            user-select: none; /* 禁止選取文字 */
         }
 
         #canvas-container {
@@ -29,22 +30,24 @@
             z-index: 1;
         }
 
-        /* UI 面板：移除狀態文字與預覽圖，保留輸入框 */
+        /* UI 面板 */
         #ui-panel {
             position: absolute;
             top: 20px;
             left: 50%;
-            transform: translateX(-50%); /* 置中 */
-            width: 80%;
+            transform: translateX(-50%);
+            width: 85%;
             max-width: 400px;
-            padding: 15px;
-            background: rgba(30, 30, 30, 0.6);
-            backdrop-filter: blur(5px);
-            border-radius: 20px;
+            padding: 10px;
+            background: rgba(20, 20, 20, 0.8);
+            backdrop-filter: blur(8px);
+            border-radius: 30px;
             z-index: 10;
             display: flex;
             gap: 10px;
             align-items: center;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255,255,255,0.1);
         }
 
         .input-group {
@@ -55,78 +58,98 @@
 
         input {
             flex: 1;
-            background: rgba(255,255,255,0.15);
+            background: transparent;
             border: none;
-            padding: 12px;
-            border-radius: 10px;
+            padding: 10px;
             color: white;
             outline: none;
             font-size: 16px;
-        }
-
-        button {
-            background: #4db8ff;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 10px;
-            color: #121212;
-            font-weight: bold;
-            font-size: 16px;
-            cursor: pointer;
-        }
-
-        /* 隱藏攝影機相關元素 */
-        #input_video, #webcam-preview, .status {
-            display: none !important;
+            text-align: center;
         }
         
-        /* 鎖定狀態指示器 (選用：讓使用者知道現在是鎖定還是操作中) */
-        #lock-indicator {
+        button {
+            background: #2196F3;
+            border: none;
+            padding: 8px 20px;
+            border-radius: 20px;
+            color: white;
+            font-weight: bold;
+            font-size: 14px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        /* 強制隱藏攝影機元素的終極方案 
+           設定 visibility: hidden 且移出畫面，確保不佔位也不顯示
+        */
+        .input_video, #input_video, .mediapipe-video {
+            position: absolute !important;
+            width: 1px !important;
+            height: 1px !important;
+            top: -10000px !important;
+            left: -10000px !important;
+            opacity: 0 !important;
+            visibility: hidden !important;
+            pointer-events: none !important;
+            z-index: -999 !important;
+        }
+        
+        /* 狀態指示器 */
+        #status-indicator {
             position: absolute;
-            top: 90px;
+            top: 80px;
             left: 50%;
             transform: translateX(-50%);
-            padding: 5px 15px;
-            background: rgba(0,0,0,0.5);
+            padding: 6px 16px;
+            background: rgba(0,0,0,0.6);
             border-radius: 20px;
-            font-size: 12px;
-            color: #aaa;
+            font-size: 13px;
+            color: #ccc;
             z-index: 9;
             pointer-events: none;
             transition: opacity 0.3s;
-            opacity: 0;
+            opacity: 0; /* 預設隱藏 */
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
-        #lock-indicator.visible {
+        #status-indicator.visible {
             opacity: 1;
         }
+        .icon { font-size: 14px; }
     </style>
 </head>
 <body>
 
     <div id="ui-panel">
         <div class="input-group">
-            <input type="text" id="molecule-input" placeholder="Enter Molecule (e.g. Water)" value="Caffeine">
-            <button onclick="fetchMolecule()">Go</button>
+            <input type="text" id="molecule-input" placeholder="輸入分子 (如 Aspirin)" value="Caffeine">
+            <button onclick="fetchMolecule()">載入</button>
         </div>
     </div>
 
-    <div id="lock-indicator">🔒 鎖定中 (握拳重置手指)</div>
+    <div id="status-indicator">
+        <span class="icon">✊</span> <span>重置位置中 (暫停旋轉)</span>
+    </div>
 
     <div id="canvas-container"></div>
     
-    <video id="input_video" playsinline></video>
+    <video id="input_video" class="input_video" playsinline></video>
 
 <script>
     // --- 變數 ---
     let scene, camera, renderer, moleculeGroup;
-    let targetRotationX = 0;
-    let targetRotationY = 0;
     
-    // 縮放控制變數
-    let currentScale = 1;      // 目前的實際大小
-    let lastFingerDist = null; // 上一幀的手指距離
-    let isLocked = false;      // 是否處於握拳鎖定狀態
+    // 控制變數
+    let currentRotationX = 0;
+    let currentRotationY = 0;
+    let currentScale = 1;
+    
+    let lastHandX = null;
+    let lastHandY = null;
+    let lastPinchDist = null;
 
+    // CPK 配色表
     const CPK_COLORS = {
         'H': 0xFFFFFF, 'C': 0x909090, 'N': 0x3050F8, 'O': 0xFF0D0D,
         'F': 0x90E050, 'CL': 0x1FF01F, 'BR': 0xA62929, 'I': 0x940094,
@@ -137,21 +160,24 @@
     function initThree() {
         const container = document.getElementById('canvas-container');
         scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x000000); // 純黑背景看起來更像全息投影
+        scene.background = new THREE.Color(0x0a0a0a); // 極深灰背景
 
         camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
-        camera.position.z = 20;
+        camera.position.z = 22;
 
         renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
-        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // 效能優化
         container.appendChild(renderer.domElement);
 
-        const ambientLight = new THREE.AmbientLight(0x606060, 2);
+        const ambientLight = new THREE.AmbientLight(0x707070, 2);
         scene.add(ambientLight);
-        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
-        dirLight.position.set(10, 10, 10);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight.position.set(10, 10, 15);
         scene.add(dirLight);
+        const backLight = new THREE.DirectionalLight(0x0055ff, 0.5); // 藍色邊緣光
+        backLight.position.set(-10, 0, -10);
+        scene.add(backLight);
 
         moleculeGroup = new THREE.Group();
         scene.add(moleculeGroup);
@@ -163,12 +189,12 @@
         });
     }
 
-    // --- 分子生成 (與之前相同) ---
+    // --- 分子生成邏輯 ---
     function createAtom(element, x, y, z) {
         const color = CPK_COLORS[element.toUpperCase()] || 0xFF00FF;
-        const radius = element.toUpperCase() === 'H' ? 0.3 : 0.5;
-        const geometry = new THREE.SphereGeometry(radius, 32, 32);
-        const material = new THREE.MeshPhongMaterial({ color: color, shininess: 100 });
+        const radius = element.toUpperCase() === 'H' ? 0.35 : 0.6; 
+        const geometry = new THREE.SphereGeometry(radius, 24, 24); // 降低面數優化手機效能
+        const material = new THREE.MeshPhongMaterial({ color: color, shininess: 80 });
         const atom = new THREE.Mesh(geometry, material);
         atom.position.set(x, y, z);
         return atom;
@@ -176,7 +202,7 @@
 
     function createBond(p1, p2) {
         const direction = new THREE.Vector3().subVectors(p2, p1);
-        const geometry = new THREE.CylinderGeometry(0.1, 0.1, direction.length(), 12);
+        const geometry = new THREE.CylinderGeometry(0.15, 0.15, direction.length(), 8);
         const material = new THREE.MeshPhongMaterial({ color: 0xcccccc });
         const bond = new THREE.Mesh(geometry, material);
         bond.position.copy(p1).add(p2).multiplyScalar(0.5);
@@ -187,14 +213,15 @@
     async function fetchMolecule() {
         const name = document.getElementById('molecule-input').value;
         const btn = document.querySelector('button');
-        btn.innerText = "...";
+        btn.innerText = "讀取中...";
         try {
             const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${name}/JSON?record_type=3d`;
             const response = await fetch(url);
-            if (!response.ok) throw new Error("Error");
+            if (!response.ok) throw new Error("API Error");
             const data = await response.json();
             const compound = data.PC_Compounds[0];
             
+            // 清除舊分子
             while(moleculeGroup.children.length > 0) moleculeGroup.remove(moleculeGroup.children[0]);
 
             const coords = compound.coords[0].conformers[0];
@@ -211,6 +238,7 @@
                 cx += x; cy += y; cz += z;
             }
             
+            // 置中計算
             cx /= atoms.aid.length; cy /= atoms.aid.length; cz /= atoms.aid.length;
             moleculeGroup.position.set(-cx, -cy, -cz);
 
@@ -226,14 +254,15 @@
                 }
             }
             
-            // 重置
+            // 重置狀態
             currentScale = 1;
-            lastFingerDist = null;
             moleculeGroup.scale.set(1, 1, 1);
             moleculeGroup.rotation.set(0,0,0);
+            currentRotationX = 0;
+            currentRotationY = 0;
             
-        } catch (e) { alert("找不到分子"); }
-        btn.innerText = "Go";
+        } catch (e) { alert("找不到該分子，請檢查拼字。"); }
+        btn.innerText = "載入";
     }
 
     function getElementSymbol(n) {
@@ -243,73 +272,87 @@
 
     // --- MediaPipe 邏輯 ---
     const videoElement = document.getElementById('input_video');
-    const lockIndicator = document.getElementById('lock-indicator');
+    const statusIndicator = document.getElementById('status-indicator');
 
     function onResults(results) {
         if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
             const landmarks = results.multiHandLandmarks[0];
             
-            // 1. 判斷是否握拳 (檢查中指指尖與手腕的距離)
-            // 9: Middle Finger MCP (根部), 12: Middle Finger Tip (指尖), 0: Wrist
+            // 關鍵點
             const wrist = landmarks[0];
             const middleTip = landmarks[12];
-            const middleBase = landmarks[9];
-            
-            // 簡單判斷：指尖非常靠近根部/手腕
-            const palmOpenDist = Math.sqrt(Math.pow(middleTip.x - wrist.x, 2) + Math.pow(middleTip.y - wrist.y, 2));
-            
-            // 閾值需測試，通常張開時距離 > 0.3，握拳時 < 0.2 (正規化座標)
-            // 這裡設定 0.15 作為分界 (視鏡頭距離而定，可微調)
-            const isFist = palmOpenDist < 0.2; 
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const handCenter = landmarks[9]; // 中指根部，作為手的位置
+
+            // 1. 判斷握拳 (Fist Detection)
+            // 簡單算法：指尖與手腕距離過近 = 握拳
+            const palmLen = Math.sqrt(Math.pow(middleTip.x - wrist.x, 2) + Math.pow(middleTip.y - wrist.y, 2));
+            const isFist = palmLen < 0.15; // 閾值 (視情況微調)
 
             if (isFist) {
-                isLocked = true;
-                lockIndicator.classList.add('visible');
-                lastFingerDist = null; // 重置距離記憶，準備下一次重新接合
-            } else {
-                isLocked = false;
-                lockIndicator.classList.remove('visible');
+                // --- 狀態：握拳 (暫停/重置) ---
+                statusIndicator.classList.add('visible');
                 
-                // --- 2. 旋轉邏輯 (保持手腕位置控制) ---
-                const handX = landmarks[9].x; 
-                const handY = landmarks[9].y;
-                targetRotationY = (handX - 0.5) * 6; 
-                targetRotationX = (handY - 0.5) * 6;
+                // 握拳時，我們只更新「上一次的位置」，但不更新旋轉角度
+                // 這樣當下次張開手時，移動量會從新的位置開始算，不會跳動
+                lastHandX = handCenter.x;
+                lastHandY = handCenter.y;
+                lastPinchDist = null; // 重置縮放基準
 
-                // --- 3. 縮放邏輯 (相對增量) ---
-                const thumbTip = landmarks[4];
-                const indexTip = landmarks[8];
-                const dist = Math.sqrt(Math.pow(thumbTip.x - indexTip.x, 2) + Math.pow(thumbTip.y - indexTip.y, 2));
+            } else {
+                // --- 狀態：張手 (操作中) ---
+                statusIndicator.classList.remove('visible');
 
-                if (lastFingerDist !== null) {
-                    // 計算變化量
-                    const delta = dist - lastFingerDist;
-                    // 靈敏度
-                    const sensitivity = 3.0; 
+                // A. 處理旋轉 (使用增量/Delta)
+                if (lastHandX !== null && lastHandY !== null) {
+                    // 計算手移動了多少 (Delta)
+                    const deltaX = handCenter.x - lastHandX;
+                    const deltaY = handCenter.y - lastHandY;
                     
-                    // 累加到 currentScale
-                    currentScale += delta * sensitivity;
+                    // 靈敏度係數 (可以調大一點讓轉動更快)
+                    const rotSensitivity = 4.0;
+
+                    // 累加角度 (注意：X軸移動控制Y軸旋轉，反之亦然)
+                    currentRotationY += deltaX * rotSensitivity;
+                    currentRotationX += deltaY * rotSensitivity;
+                }
+
+                // 更新「上一次位置」為「現在位置」
+                lastHandX = handCenter.x;
+                lastHandY = handCenter.y;
+
+
+                // B. 處理縮放 (使用增量/Delta)
+                // 計算拇指與食指距離
+                const pinchDist = Math.sqrt(Math.pow(thumbTip.x - indexTip.x, 2) + Math.pow(thumbTip.y - indexTip.y, 2));
+                
+                if (lastPinchDist !== null) {
+                    const deltaPinch = pinchDist - lastPinchDist;
+                    const scaleSensitivity = 3.5;
                     
-                    // 限制範圍 (0.1倍 ~ 10倍)
-                    currentScale = Math.max(0.1, Math.min(currentScale, 10.0));
+                    currentScale += deltaPinch * scaleSensitivity;
+                    currentScale = Math.max(0.1, Math.min(currentScale, 8.0)); // 限制大小
                 }
                 
-                // 更新上一幀距離
-                lastFingerDist = dist;
+                lastPinchDist = pinchDist;
             }
 
         } else {
-            // 手離開畫面時，視為鎖定，重置距離
-            lastFingerDist = null;
-            lockIndicator.classList.remove('visible');
+            // 手離開畫面，重置追蹤數據
+            lastHandX = null;
+            lastHandY = null;
+            lastPinchDist = null;
+            statusIndicator.classList.remove('visible');
         }
     }
 
+    // MediaPipe 設定
     const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
     hands.setOptions({
         maxNumHands: 1,
         modelComplexity: 1,
-        minDetectionConfidence: 0.6, // 提高一點以防誤判
+        minDetectionConfidence: 0.6,
         minTrackingConfidence: 0.6
     });
     hands.onResults(onResults);
@@ -325,11 +368,12 @@
         requestAnimationFrame(animate);
 
         if (moleculeGroup) {
-            // 平滑旋轉
-            moleculeGroup.rotation.y += (targetRotationY - moleculeGroup.rotation.y) * 0.1;
-            moleculeGroup.rotation.x += (targetRotationX - moleculeGroup.rotation.x) * 0.1;
+            // 平滑插值 (Lerp) 讓畫面更順暢
+            // 旋轉
+            moleculeGroup.rotation.y += (currentRotationY - moleculeGroup.rotation.y) * 0.1;
+            moleculeGroup.rotation.x += (currentRotationX - moleculeGroup.rotation.x) * 0.1;
             
-            // 平滑縮放
+            // 縮放
             const s = moleculeGroup.scale.x;
             const newS = s + (currentScale - s) * 0.15;
             moleculeGroup.scale.set(newS, newS, newS);
