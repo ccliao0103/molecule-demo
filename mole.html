@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js 手勢互動分子實驗室</title>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        /* --- 現代化 UI 風格設定 --- */
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #121212; /* 深色背景 */
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            color: #ffffff;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+
+        /* 懸浮控制面板 */
+        #ui-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 300px;
+            padding: 20px;
+            background: rgba(30, 30, 30, 0.85); /* 半透明磨砂感 */
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            z-index: 10;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        h1 {
+            font-size: 18px;
+            margin: 0 0 15px 0;
+            font-weight: 500;
+            color: #4db8ff;
+            letter-spacing: 1px;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        input {
+            flex: 1;
+            background: rgba(255,255,255,0.1);
+            border: none;
+            padding: 10px;
+            border-radius: 6px;
+            color: white;
+            outline: none;
+            transition: 0.3s;
+        }
+        input:focus {
+            background: rgba(255,255,255,0.2);
+            box-shadow: 0 0 0 2px #4db8ff;
+        }
+
+        button {
+            background: #4db8ff;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 6px;
+            color: #121212;
+            font-weight: bold;
+            cursor: pointer;
+            transition: 0.3s;
+        }
+        button:hover {
+            background: #73caff;
+        }
+
+        .status {
+            font-size: 12px;
+            color: #aaaaaa;
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #ff4d4d; /* 預設紅色：未偵測 */
+        }
+        .status-dot.active {
+            background-color: #00ff88; /* 綠色：偵測中 */
+            box-shadow: 0 0 8px #00ff88;
+        }
+
+        /* 攝影機預覽 (縮小在右下角) */
+        #webcam-preview {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 200px;
+            height: 150px;
+            border-radius: 8px;
+            z-index: 10;
+            transform: scaleX(-1); /* 鏡像翻轉 */
+            opacity: 0.8;
+            object-fit: cover;
+            border: 2px solid rgba(255,255,255,0.2);
+        }
+        
+        .instructions {
+            font-size: 13px;
+            line-height: 1.6;
+            color: #ccc;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            padding-top: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-panel">
+        <h1>MOLECULE VIEW</h1>
+        <div class="input-group">
+            <input type="text" id="molecule-input" placeholder="例如: Caffeine, Water" value="Caffeine">
+            <button onclick="fetchMolecule()">Load</button>
+        </div>
+        
+        <div class="instructions">
+            <strong>手勢操作：</strong><br>
+            ? <b>移動手掌：</b> 旋轉分子<br>
+            ?? <b>拇指+食指：</b> 捏合/張開進行縮放
+        </div>
+
+        <div class="status">
+            <div class="status-dot" id="status-dot"></div>
+            <span id="status-text">等待攝影機啟動...</span>
+        </div>
+    </div>
+
+    <video id="input_video" style="display:none"></video>
+    <canvas id="webcam-preview"></canvas>
+
+    <div id="canvas-container"></div>
+
+<script>
+    // --- 全域變數 ---
+    let scene, camera, renderer, moleculeGroup;
+    let targetRotationX = 0;
+    let targetRotationY = 0;
+    let targetScale = 1;
+    
+    // CPK 配色表 (常見元素顏色)
+    const CPK_COLORS = {
+        'H': 0xFFFFFF, 'C': 0x909090, 'N': 0x3050F8, 'O': 0xFF0D0D,
+        'F': 0x90E050, 'CL': 0x1FF01F, 'BR': 0xA62929, 'I': 0x940094,
+        'HE': 0x4FFFFF, 'NE': 0xB3E3F5, 'AR': 0x80D1E3, 'S': 0xFFFF30,
+        'P': 0xFF8000
+    };
+
+    // --- 1. Three.js 場景初始化 ---
+    function initThree() {
+        const container = document.getElementById('canvas-container');
+        
+        // 場景
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x121212);
+        scene.fog = new THREE.Fog(0x121212, 10, 50);
+
+        // 攝影機
+        camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 20;
+
+        // 渲染器
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        // 燈光
+        const ambientLight = new THREE.AmbientLight(0x404040, 2); // 環境光
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5); // 定向光
+        dirLight.position.set(10, 10, 10);
+        scene.add(dirLight);
+        
+        const backLight = new THREE.DirectionalLight(0x4444ff, 0.5); // 藍色背光，增加科技感
+        backLight.position.set(-10, -5, -10);
+        scene.add(backLight);
+
+        // 分子容器
+        moleculeGroup = new THREE.Group();
+        scene.add(moleculeGroup);
+
+        // 監聽視窗大小改變
+        window.addEventListener('resize', onWindowResize, false);
+    }
+
+    function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // --- 2. 分子生成邏輯 ---
+    
+    // 建立原子
+    function createAtom(element, x, y, z) {
+        const color = CPK_COLORS[element.toUpperCase()] || 0xFF00FF; // 預設洋紅色
+        const radius = element.toUpperCase() === 'H' ? 0.3 : 0.5; // 氫原子小一點
+        
+        const geometry = new THREE.SphereGeometry(radius, 32, 32);
+        const material = new THREE.MeshPhongMaterial({ 
+            color: color, 
+            shininess: 100,
+            specular: 0x555555
+        });
+        const atom = new THREE.Mesh(geometry, material);
+        atom.position.set(x, y, z);
+        return atom;
+    }
+
+    // 建立化學鍵
+    function createBond(point1, point2) {
+        const direction = new THREE.Vector3().subVectors(point2, point1);
+        const length = direction.length();
+        
+        const geometry = new THREE.CylinderGeometry(0.1, 0.1, length, 12);
+        const material = new THREE.MeshPhongMaterial({ color: 0xcccccc });
+        const bond = new THREE.Mesh(geometry, material);
+        
+        // 調整圓柱體位置與角度
+        bond.position.copy(point1).add(point2).multiplyScalar(0.5);
+        bond.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
+        
+        return bond;
+    }
+
+    // 從 PubChem API 獲取並解析數據
+    async function fetchMolecule() {
+        const name = document.getElementById('molecule-input').value;
+        const btn = document.querySelector('button');
+        const statusText = document.getElementById('status-text');
+        
+        btn.innerText = "Loading...";
+        btn.disabled = true;
+
+        try {
+            // 步驟 1: 搜尋 CID
+            // 請求 3D 結構 (record_type=3d)
+            const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${name}/JSON?record_type=3d`;
+            
+            const response = await fetch(url);
+            if (!response.ok) throw new Error("找不到該分子或無 3D 結構");
+            
+            const data = await response.json();
+            const compound = data.PC_Compounds[0];
+            
+            // 清空舊分子
+            while(moleculeGroup.children.length > 0){ 
+                moleculeGroup.remove(moleculeGroup.children[0]); 
+            }
+
+            // 解析原子
+            const coords = compound.coords[0].conformers[0];
+            const atoms = compound.atoms; // element IDs
+            const atomMeshes = [];
+
+            // 建立中心點以進行置中
+            let centerX = 0, centerY = 0, centerZ = 0;
+
+            for (let i = 0; i < atoms.aid.length; i++) {
+                const x = coords.x[i];
+                const y = coords.y[i];
+                const z = coords.z[i];
+                const elementId = atoms.element[i];
+                // 簡單對應：這裡因為 PubChem 給的是原子序，我們簡單轉成符號(只列常用的避免太長)
+                // 實際專案可使用完整對照表
+                let elementSym = getElementSymbol(elementId);
+                
+                const atom = createAtom(elementSym, x, y, z);
+                moleculeGroup.add(atom);
+                atomMeshes.push({ mesh: atom, x, y, z });
+
+                centerX += x; centerY += y; centerZ += z;
+            }
+
+            // 計算平均位置並將分子置中
+            centerX /= atoms.aid.length;
+            centerY /= atoms.aid.length;
+            centerZ /= atoms.aid.length;
+            
+            moleculeGroup.position.set(-centerX, -centerY, -centerZ);
+
+            // 解析化學鍵 (如果有)
+            if (compound.bonds) {
+                const aid1 = compound.bonds.aid1;
+                const aid2 = compound.bonds.aid2;
+                
+                for (let i = 0; i < aid1.length; i++) {
+                    // PubChem index 是從 1 開始，陣列是 0，需注意對應，但這裡我們用 atomMeshes 陣列
+                    // 這裡簡化處理，因為 PubChem 的 aid 通常對應陣列順序+1
+                    const idx1 = aid1[i] - 1;
+                    const idx2 = aid2[i] - 1;
+                    
+                    if(atomMeshes[idx1] && atomMeshes[idx2]) {
+                        const p1 = atomMeshes[idx1].mesh.position;
+                        const p2 = atomMeshes[idx2].mesh.position;
+                        const bond = createBond(p1, p2);
+                        moleculeGroup.add(bond);
+                    }
+                }
+            }
+            
+            // 重置旋轉與縮放
+            targetScale = 1;
+            moleculeGroup.scale.set(1, 1, 1);
+            moleculeGroup.rotation.set(0,0,0);
+
+            statusText.innerText = `已載入: ${name}`;
+
+        } catch (error) {
+            console.error(error);
+            alert("載入失敗：請確認拼字正確，或該分子無 3D 資料。");
+            statusText.innerText = "載入錯誤";
+        } finally {
+            btn.innerText = "Load";
+            btn.disabled = false;
+        }
+    }
+
+    // 輔助：原子序轉符號 (簡化版)
+    function getElementSymbol(atomicNumber) {
+        const table = {1:'H', 6:'C', 7:'N', 8:'O', 9:'F', 15:'P', 16:'S', 17:'CL', 35:'BR', 53:'I'};
+        return table[atomicNumber] || 'C'; // 預設回傳 C
+    }
+
+    // --- 3. MediaPipe 手勢控制邏輯 ---
+    
+    const videoElement = document.getElementById('input_video');
+    const previewCanvas = document.getElementById('webcam-preview');
+    const previewCtx = previewCanvas.getContext('2d');
+    const statusDot = document.getElementById('status-dot');
+
+    function onResults(results) {
+        // 繪製右下角的小預覽圖
+        previewCtx.save();
+        previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+        previewCtx.drawImage(results.image, 0, 0, previewCanvas.width, previewCanvas.height);
+        
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            statusDot.classList.add('active');
+            document.getElementById('status-text').innerText = "手勢偵測中";
+            
+            // 畫出手部骨架在預覽圖上
+            for (const landmarks of results.multiHandLandmarks) {
+                drawConnectors(previewCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                drawLandmarks(previewCtx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 2});
+            }
+
+            // --- 核心控制邏輯 ---
+            // 取第一隻偵測到的手
+            const landmarks = results.multiHandLandmarks[0];
+            
+            // 1. 旋轉控制：使用手腕 (Index 0) 或 中指根部 (Index 9) 的位置
+            // MediaPipe 座標：x, y 都是 0~1。x=0 是左邊, x=1 是右邊
+            // 我們將其映射到旋轉角度
+            const handX = landmarks[9].x; 
+            const handY = landmarks[9].y;
+            
+            // 映射邏輯：手在畫面中間不動，往左分子左轉，往右分子右轉
+            // 簡單線性映射：(0 ~ 1) -> (-PI ~ PI)
+            // 為了操作順手，我們加上緩衝區或靈敏度調整
+            targetRotationY = (handX - 0.5) * 5; // Y軸旋轉 (左右)
+            targetRotationX = (handY - 0.5) * 5; // X軸旋轉 (上下)
+
+            // 2. 縮放控制：計算拇指尖 (4) 與 食指尖 (8) 的距離
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            
+            // 計算 3D 空間中的歐幾里得距離 (這裡簡化用 x,y 距離即可，因為深度不準)
+            const distance = Math.sqrt(
+                Math.pow(thumbTip.x - indexTip.x, 2) + 
+                Math.pow(thumbTip.y - indexTip.y, 2)
+            );
+
+            // 距離通常在 0.02 (閉合) 到 0.2 (張開) 之間
+            // 映射到縮放倍率 0.5 ~ 3.0
+            // 公式： (距離 - 最小值) * 放大係數 + 基礎值
+            const sensitivity = 8; 
+            const baseScale = 0.5;
+            let rawScale = (distance * sensitivity) + baseScale;
+            
+            // 限制最大最小縮放
+            targetScale = Math.min(Math.max(rawScale, 0.5), 5.0);
+
+        } else {
+            statusDot.classList.remove('active');
+            document.getElementById('status-text').innerText = "未偵測到手部";
+        }
+        previewCtx.restore();
+    }
+
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(onResults);
+
+    // 啟動攝影機
+    const cameraUtils = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 640,
+        height: 480
+    });
+    cameraUtils.start();
+
+    // --- 4. 動畫迴圈 (Render Loop) ---
+    function animate() {
+        requestAnimationFrame(animate);
+
+        if (moleculeGroup) {
+            // 平滑插值 (Lerp) 讓動作更流暢，不會抖動
+            // 0.1 是平滑係數，越小越滑但延遲越高
+            moleculeGroup.rotation.y += (targetRotationY - moleculeGroup.rotation.y) * 0.1;
+            moleculeGroup.rotation.x += (targetRotationX - moleculeGroup.rotation.x) * 0.1;
+            
+            const currentScale = moleculeGroup.scale.x;
+            const newScale = currentScale + (targetScale - currentScale) * 0.1;
+            moleculeGroup.scale.set(newScale, newScale, newScale);
+            
+            // 讓分子自己也稍微自轉一點點，增加動態感 (如果手放開的話)
+            // moleculeGroup.rotation.y += 0.002; 
+        }
+
+        renderer.render(scene, camera);
+    }
+
+    // 啟動程式
+    initThree();
+    fetchMolecule(); // 預設載入 Caffeine
+    animate();
+
+</script>
+</body>
+</html>
